@@ -2,14 +2,18 @@
 	chan chan - Script by Nam HUB
 	GUI phong cách Liquid Glass cho Roblox
 	Đặt trong: StarterPlayer > StarterPlayerScripts (LocalScript)
+
+	Bản tối ưu:
+	- Liquid Glass chỉ nằm BÊN TRONG cửa sổ GUI (không còn BlurEffect toàn màn hình)
+	- Bỏ bộ đếm thời gian; Dynamic Island hiển thị tab + trạng thái chức năng thực tế
+	- Thu nhỏ -> hình tròn bên trái; nhấn một lần để mở; nhấn giữ để xem chức năng đang bật
 ]]
 
 --========================= DỊCH VỤ =========================
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
-local Lighting = game:GetService("Lighting")
+local Lighting = game:GetService("Lighting") -- chỉ dùng để dọn BlurEffect của bản cũ; bản này KHÔNG tạo blur toàn màn hình
 local StarterGui = game:GetService("StarterGui")
 
 local player = Players.LocalPlayer
@@ -29,7 +33,10 @@ end
 local FONT_REG, FONT_MED, FONT_BOLD = Enum.Font.SourceSans, Enum.Font.SourceSansSemibold, Enum.Font.SourceSansBold
 local WHITE = Color3.new(1, 1, 1)
 local WIN_W, WIN_H, MIN_H = 800, 500, 66
-local ISL_W_OPEN, ISL_W_CLOSED, ISL_H = 340, 250, 46
+local ISL_W_PILL, ISL_H, INFO_W = 280, 48, 260     -- Dynamic Island: dạng viên thuốc / chiều cao / bảng chi tiết
+local ORB_TARGET_PX, ORB_MIN, ORB_MAX = 50, 40, 90 -- nút tròn khi thu nhỏ (đủ lớn để chạm trên điện thoại)
+local ISL_ROW_H, ISL_MAX_ROWS = 40, 6               -- hàng trong bảng chi tiết
+local HOLD_TIME, MOVE_TOL = 0.45, 20                -- ngưỡng nhấn giữ (giây) / dung sai di chuyển (px)
 local SCRIPT_NAME, SCRIPT_VERSION, SCRIPT_AUTHOR = "chan chan", "v1.0.0", "Nam HUB"
 
 -- Bảng màu giao diện Sáng / Tối
@@ -39,12 +46,14 @@ local THEMES = {
 		field = Color3.fromRGB(252, 254, 255), sidebar = Color3.fromRGB(52, 112, 205),
 		text = Color3.fromRGB(18, 68, 170), sub = Color3.fromRGB(88, 132, 196),
 		track = Color3.fromRGB(190, 212, 240), off = Color3.fromRGB(170, 190, 216),
+		frost = Color3.fromRGB(238, 244, 255),
 	},
 	["Tối"] = {
 		window = Color3.fromRGB(14, 24, 56), panel = Color3.fromRGB(32, 46, 94),
 		field = Color3.fromRGB(24, 36, 78), sidebar = Color3.fromRGB(8, 14, 38),
 		text = Color3.fromRGB(232, 242, 255), sub = Color3.fromRGB(150, 172, 216),
 		track = Color3.fromRGB(52, 68, 118), off = Color3.fromRGB(82, 96, 138),
+		frost = Color3.fromRGB(96, 110, 210),
 	},
 }
 
@@ -77,7 +86,9 @@ local state = {
 	transp = 80,    -- độ trong suốt giao diện (0-100%)
 	bright = 16,    -- độ sáng (0-40px): độ rực của viền phát sáng + lớp phản chiếu kính
 	sysNotif = true, scriptNotif = true,
-	open = false, minimized = false, maximized = false,
+	open = false, minimized = false, maximized = false, -- minimized = đã thu nhỏ thành hình tròn bên trái
+	info = false,      -- bảng chi tiết của Dynamic Island đang mở (nhấn giữ)
+	tab = "Cài đặt",  -- tab đang chọn
 }
 
 --========================= TIỆN ÍCH =========================
@@ -91,6 +102,20 @@ end
 local function tween(obj, t, props, style, dir)
 	local tw = TweenService:Create(obj, TweenInfo.new(t, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out), props)
 	tw:Play()
+	return tw
+end
+
+-- Nhóm tween: huỷ các tween cũ của nhóm trước khi chạy chuyển trạng thái mới (tránh tween chồng chéo)
+local winGroup, islGroup = {}, {}
+local function groupCancel(g)
+	for i = #g, 1, -1 do
+		g[i]:Cancel()
+		g[i] = nil
+	end
+end
+local function groupTween(g, obj, t, props, style, dir)
+	local tw = tween(obj, t, props, style, dir)
+	table.insert(g, tw)
 	return tw
 end
 
@@ -112,6 +137,7 @@ end
 
 -- Sổ đăng ký để cập nhật khi đổi theme / màu / độ trong suốt
 local themed, hooks, glassList, accentGrads, accentColors = {}, {}, {}, {}, {}
+local applyIsland, refreshIsland -- khai báo trước, gán ở phần Dynamic Island
 
 local function reg(obj, prop, key)
 	table.insert(themed, { obj = obj, prop = prop, key = key })
@@ -135,10 +161,10 @@ local gui = create("ScreenGui", {
 })
 local uiScale = create("UIScale", { Scale = 1 }, gui)
 
-local blur = create("BlurEffect", { Name = "chanchan_Blur", Size = 0 }, Lighting)
-
---========================= HIỆU ỨNG KÍNH / ĐỘ SÁNG / BLUR =========================
-local win, winStroke, shine -- khai báo trước
+--========================= HIỆU ỨNG KÍNH / ĐỘ SÁNG =========================
+-- Toàn bộ hiệu ứng kính nằm BÊN TRONG cửa sổ (CanvasGroup): nền trong suốt + gradient + lớp kính mờ + viền sáng.
+-- Không dùng BlurEffect/Lighting nên thế giới game không bao giờ bị làm mờ.
+local win, winStroke, shine, frost -- khai báo trước
 
 local function applyGlass(smooth)
 	local t = state.transp / 100
@@ -163,9 +189,12 @@ local function applyBright()
 	if shine then shine.BackgroundTransparency = 0.92 - b * 0.3 end
 end
 
-local function updateBlur(instant)
-	local target = state.open and (state.blur / 100) * 24 or 0
-	if instant then blur.Size = target else tween(blur, 0.35, { Size = target }) end
+-- "Độ mờ nền": độ dày của lớp kính mờ (frost) nằm trong cửa sổ
+local function applyFrost(smooth)
+	if not frost then return end
+	local t = 1 - (state.blur / 100) * 0.5
+	if smooth then tween(frost, 0.25, { BackgroundTransparency = t }, Enum.EasingStyle.Quad)
+	else frost.BackgroundTransparency = t end
 end
 
 local function applyTheme()
@@ -234,6 +263,14 @@ reg(win, "BackgroundColor3", "window")
 regGlass(win, "window")
 local winScale = create("UIScale", { Scale = 0.92 }, win)
 
+-- Lớp kính mờ (frost) bên trong cửa sổ, nằm dưới mọi thành phần khác
+frost = create("Frame", { Name = "Frost", Size = UDim2.fromScale(1, 1), BorderSizePixel = 0, ZIndex = 0 }, win)
+reg(frost, "BackgroundColor3", "frost")
+create("UIGradient", { Rotation = 35, Transparency = NumberSequence.new({
+	NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 0.55),
+}) }, frost)
+applyFrost(false)
+
 winStroke = create("UIStroke", { Color = WHITE, Thickness = 2, Transparency = 0.2, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, win)
 regAccentGrad(winStroke)
 
@@ -271,7 +308,7 @@ local function createTab(name, icon, y)
 	label(b, { Text = icon, Position = UDim2.fromOffset(14, 0), Size = UDim2.fromOffset(30, 48), TextSize = 22,
 		TextXAlignment = Enum.TextXAlignment.Center })
 	label(b, { Text = name, Position = UDim2.fromOffset(52, 0), Size = UDim2.new(1, -56, 1, 0), TextSize = 21, Font = FONT_MED })
-	tabs[name] = { btn = b, stroke = st }
+	tabs[name] = { btn = b, stroke = st, icon = icon }
 	return b
 end
 local tabSettings = createTab("Cài đặt", "⚙️", 84)
@@ -561,13 +598,14 @@ end
 createDropdown(scLeft, 4, "🖥️  Chế độ hiển thị", { "Trong suốt", "Bình thường" }, function() return state.mode end, function(opt)
 	state.mode = opt
 	applyGlass(true)
+	refreshIsland()
 	showToast("Chế độ hiển thị: " .. opt)
 end)
 
 -- Ba thanh trượt
 createSlider(scLeft, 5, "Độ mờ nền", 0, 100, state.blur, function(v) return v .. "%" end, function(v)
 	state.blur = v
-	updateBlur(true)
+	applyFrost(false)
 end)
 createSlider(scLeft, 6, "Độ trong suốt giao diện", 0, 100, state.transp, function(v) return v .. "%" end, function(v)
 	state.transp = v
@@ -581,11 +619,13 @@ end)
 -- Thông báo
 createToggle(scRight, 1, "Thông báo hệ thống", "Hiển thị thông báo chung", state.sysNotif, function(v)
 	state.sysNotif = v
+	refreshIsland()
 	if v then notifySystem(SCRIPT_NAME, "Đã bật thông báo hệ thống") end
 	showToast(v and "Đã bật thông báo hệ thống" or "Đã tắt thông báo hệ thống")
 end)
 createToggle(scRight, 2, "Thông báo script", "Thông báo khi có cập nhật", state.scriptNotif, function(v)
 	state.scriptNotif = v
+	refreshIsland()
 	if v then showToast("Đã bật thông báo script") end
 end)
 
@@ -615,10 +655,9 @@ do
 end
 
 --========================= CHUYỂN TAB =========================
-local currentTab
 local function showTab(name, instant)
-	if currentTab == name and not instant then return end
-	currentTab = name
+	if state.tab == name and not instant then return end
+	state.tab = name
 	closeDropdown()
 	for n, t in tabs do
 		local sel = n == name
@@ -630,6 +669,7 @@ local function showTab(name, instant)
 			tween(t.page, 0.35, { Position = UDim2.fromOffset(0, 0) })
 		end
 	end
+	if refreshIsland then refreshIsland() end -- Dynamic Island cập nhật ngay khi đổi tab
 end
 connect(tabSettings.Activated, function() showTab("Cài đặt") end)
 connect(tabInfo.Activated, function() showTab("Thông tin") end)
@@ -645,7 +685,6 @@ local function layoutTarget()
 	else
 		w, h, pos = WIN_W, WIN_H, normalPos
 	end
-	if state.minimized then h = MIN_H end
 	return UDim2.fromOffset(w, h), pos
 end
 
@@ -662,110 +701,332 @@ local function updateScale()
 	local v = camera.ViewportSize
 	uiScale.Scale = math.clamp(math.min(v.X / 860, v.Y / 600), 0.4, 1.25)
 	if state.maximized or state.open then applyLayout(false) end
+	if applyIsland then applyIsland(false) end -- nút tròn giữ kích thước chạm ổn định theo tỷ lệ màn hình
 end
 connect(camera:GetPropertyChangedSignal("ViewportSize"), updateScale)
 
 --========================= DYNAMIC ISLAND =========================
+-- Không còn bộ đếm thời gian. Mọi nội dung đọc trực tiếp từ `state` (không có trạng thái giả).
+-- Chỉ có MỘT đối tượng island (tạo một lần), đổi hình dạng bằng kích thước/vị trí:
+--   • viên thuốc ở giữa phía trên : tab đang chọn + trạng thái
+--   • hình tròn sát bên trái      : khi người dùng thu nhỏ GUI
+--   • bảng chi tiết               : khi nhấn giữ, liệt kê các chức năng đang bật (chỉ xem)
+
+-- Danh sách chức năng mà Dynamic Island theo dõi (đọc từ state thật)
+local FEATURES = {
+	{ name = "Thông báo hệ thống", on = function() return state.sysNotif end,
+		detail = function() return "Thông báo của Roblox" end },
+	{ name = "Thông báo script", on = function() return state.scriptNotif end,
+		detail = function() return "Hiển thị ngay trong GUI" end },
+	{ name = "Chế độ trong suốt", on = function() return state.mode == "Trong suốt" end,
+		detail = function() return string.format("Trong suốt %d%% · Mờ kính %d%%", state.transp, state.blur) end },
+}
+
+local function countEnabled()
+	local n = 0
+	for _, f in FEATURES do
+		if f.on() then n += 1 end
+	end
+	return n
+end
+
+local function enabledFeatures()
+	local list = {}
+	for _, f in FEATURES do
+		if f.on() then table.insert(list, { name = f.name, detail = f.detail() }) end
+	end
+	return list
+end
+
 local island = create("TextButton", {
 	Name = "DynamicIsland", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 10),
-	Size = UDim2.fromOffset(ISL_W_CLOSED, ISL_H), BackgroundColor3 = Color3.fromRGB(10, 22, 60), BackgroundTransparency = 0.08,
-	Text = "", AutoButtonColor = false, ClipsDescendants = true, BorderSizePixel = 0,
+	Size = UDim2.fromOffset(ISL_W_PILL, ISL_H), BackgroundColor3 = WHITE, BackgroundTransparency = 0.16,
+	Text = "", AutoButtonColor = false, ClipsDescendants = true, BorderSizePixel = 0, ZIndex = 50,
 }, gui)
-corner(island, 23)
-create("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(70, 130, 230), Color3.fromRGB(40, 50, 120)), Rotation = 0 }, island)
+local islandCorner = corner(island, ISL_H / 2)
+create("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(58, 128, 240), Color3.fromRGB(118, 78, 218)), Rotation = 25 }, island)
 do
-	local st = create("UIStroke", { Color = WHITE, Thickness = 2, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, island)
+	local st = create("UIStroke", { Color = WHITE, Thickness = 2, Transparency = 0.15, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, island)
 	regAccentGrad(st)
 end
 
-local crownBg = create("Frame", { AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 8, 0.5, 0), Size = UDim2.fromOffset(32, 32),
+-- Biểu tượng tròn (biểu tượng của tab hiện tại; khi thu nhỏ là logo 👑 của script)
+local islandIcon = create("Frame", { Name = "Icon", Position = UDim2.fromOffset(8, 8), Size = UDim2.fromOffset(32, 32),
 	BackgroundColor3 = WHITE, BorderSizePixel = 0 }, island)
-corner(crownBg, 16)
-regAccentGrad(crownBg, 45)
-label(crownBg, { Text = "👑", Size = UDim2.fromScale(1, 1), TextSize = 18, TextXAlignment = Enum.TextXAlignment.Center })
+create("UICorner", { CornerRadius = UDim.new(0.5, 0) }, islandIcon) -- luôn là hình tròn đúng tỷ lệ
+regAccentGrad(islandIcon, 45)
+local islandIconLbl = label(islandIcon, { Text = "👑", Size = UDim2.fromScale(1, 1), TextSize = 18,
+	TextXAlignment = Enum.TextXAlignment.Center })
 
-local nameLbl = label(island, { Text = SCRIPT_NAME, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 50, 0.5, 0),
-	Size = UDim2.fromOffset(100, 24), Font = FONT_BOLD, TextSize = 22, TextTransparency = 1 })
-local divider = create("Frame", { AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 156, 0.5, 0), Size = UDim2.fromOffset(1, 22),
-	BackgroundColor3 = WHITE, BackgroundTransparency = 1, BorderSizePixel = 0 }, island)
-local timeLbl = label(island, { Text = "00:00:00", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 50, 0.5, 0),
-	Size = UDim2.fromOffset(90, 24), Font = FONT_MED, TextSize = 21 })
+local islandTitle = label(island, { Position = UDim2.fromOffset(50, 4), Size = UDim2.new(1, -100, 0, 24),
+	Font = FONT_BOLD, TextSize = 20, TextTruncate = Enum.TextTruncate.AtEnd })
+local islandStatus = label(island, { Position = UDim2.fromOffset(50, 26), Size = UDim2.new(1, -100, 0, 18),
+	Font = FONT_REG, TextSize = 14, TextColor3 = Color3.fromRGB(226, 236, 255), TextTruncate = Enum.TextTruncate.AtEnd })
 
--- Nút tạm dừng (vẽ bằng Frame, không dùng ảnh)
-local pauseBtn = create("TextButton", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -48, 0.5, 0), Size = UDim2.fromOffset(34, 34),
-	BackgroundColor3 = WHITE, BackgroundTransparency = 0.82, Text = "", AutoButtonColor = false, BorderSizePixel = 0 }, island)
-corner(pauseBtn, 17)
-local bar1 = create("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, -4, 0.5, 0), Size = UDim2.fromOffset(4, 14), BackgroundColor3 = WHITE, BorderSizePixel = 0 }, pauseBtn)
-local bar2 = create("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 4, 0.5, 0), Size = UDim2.fromOffset(4, 14), BackgroundColor3 = WHITE, BorderSizePixel = 0 }, pauseBtn)
-corner(bar1, 1) corner(bar2, 1)
-local playLbl = label(pauseBtn, { Text = "▶", Size = UDim2.fromScale(1, 1), TextSize = 15, TextXAlignment = Enum.TextXAlignment.Center, Visible = false })
-
--- Nút cài đặt
-local gearBtn = create("TextButton", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(34, 34),
+-- Nút cài đặt (giữ nguyên chức năng cũ: mở tab Cài đặt)
+local gearBtn = create("TextButton", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0, ISL_H / 2), Size = UDim2.fromOffset(34, 34),
 	BackgroundColor3 = WHITE, BackgroundTransparency = 0.82, Text = "⚙️", TextSize = 18, AutoButtonColor = false, BorderSizePixel = 0 }, island)
 corner(gearBtn, 17)
 
--- Bộ đếm thời gian: chạy từ lúc script khởi động, độc lập với việc mở/đóng GUI
-local elapsed, lastTick, paused, shownSec = 0, os.clock(), false, -1
-connect(RunService.Heartbeat, function()
-	local now = os.clock()
-	if not paused then elapsed += now - lastTick end
-	lastTick = now
-	local sec = math.floor(elapsed)
-	if sec ~= shownSec then
-		shownSec = sec
-		timeLbl.Text = string.format("%02d:%02d:%02d", sec // 3600, sec % 3600 // 60, sec % 60)
+-- Bảng chi tiết (tạo sẵn một lần, chỉ đổi nội dung/hiển thị)
+local infoList = create("Frame", { Name = "InfoList", Position = UDim2.fromOffset(10, 52), Size = UDim2.new(1, -20, 1, -62),
+	BackgroundTransparency = 1, Visible = false }, island)
+local infoRows = {}
+for i = 1, ISL_MAX_ROWS do
+	local r = create("Frame", { Position = UDim2.fromOffset(0, (i - 1) * ISL_ROW_H), Size = UDim2.new(1, 0, 0, ISL_ROW_H - 4),
+		BackgroundColor3 = WHITE, BackgroundTransparency = 0.88, BorderSizePixel = 0, Visible = false }, infoList)
+	corner(r, 10)
+	local dot = create("Frame", { AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 8, 0.5, 0), Size = UDim2.fromOffset(8, 8),
+		BackgroundColor3 = WHITE, BorderSizePixel = 0 }, r)
+	corner(dot, 4)
+	regAccentGrad(dot, 45)
+	local nm = label(r, { Position = UDim2.fromOffset(24, 1), Size = UDim2.new(1, -72, 0, 18), Font = FONT_BOLD, TextSize = 16,
+		TextTruncate = Enum.TextTruncate.AtEnd })
+	label(r, { Text = "Bật", AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 1), Size = UDim2.fromOffset(40, 18),
+		Font = FONT_BOLD, TextSize = 15, TextXAlignment = Enum.TextXAlignment.Right, TextColor3 = Color3.fromRGB(130, 240, 175) })
+	local dt = label(r, { Position = UDim2.fromOffset(24, 18), Size = UDim2.new(1, -32, 0, 16), Font = FONT_REG, TextSize = 13,
+		TextColor3 = Color3.fromRGB(205, 220, 252), TextTruncate = Enum.TextTruncate.AtEnd })
+	infoRows[i] = { frame = r, name = nm, detail = dt }
+end
+local infoEmpty = label(infoList, { Text = "Chưa có chức năng nào đang bật", Size = UDim2.new(1, 0, 0, 30), Font = FONT_MED, TextSize = 15,
+	TextXAlignment = Enum.TextXAlignment.Center, TextColor3 = Color3.fromRGB(226, 236, 255), Visible = false })
+local infoMore = label(infoList, { Size = UDim2.new(1, 0, 0, 20), Font = FONT_REG, TextSize = 14,
+	TextXAlignment = Enum.TextXAlignment.Center, TextColor3 = Color3.fromRGB(226, 236, 255), Visible = false })
+
+local infoH = 34 -- chiều cao phần danh sách khi bảng chi tiết mở
+
+-- Điền nội dung bảng chi tiết từ trạng thái thực tế; trả về chiều cao phần danh sách
+local function fillInfoRows()
+	local list = enabledFeatures()
+	local total = #list
+	local shown = math.min(total, ISL_MAX_ROWS)
+	for i, r in infoRows do
+		local f = list[i]
+		if i <= shown and f then
+			r.frame.Visible = true
+			r.name.Text = f.name
+			r.detail.Text = f.detail
+		else
+			r.frame.Visible = false
+		end
 	end
+	infoEmpty.Visible = total == 0
+	local more = total - shown
+	infoMore.Visible = more > 0
+	if more > 0 then
+		infoMore.Text = "+" .. more .. " chức năng khác"
+		infoMore.Position = UDim2.fromOffset(0, shown * ISL_ROW_H)
+	end
+	if total == 0 then return 34 end
+	return shown * ISL_ROW_H + (more > 0 and 22 or 0)
+end
+
+local function islandIconText()
+	if state.minimized and not state.open and not state.info then return "👑" end
+	local t = tabs[state.tab]
+	return t and t.icon or "👑"
+end
+
+-- Áp dụng hình dạng hiện tại của island từ state. Một nơi duy nhất điều khiển island.
+local wasInfoShape = false
+applyIsland = function(animate)
+	local ui = uiScale.Scale
+	local orb = state.minimized and not state.open
+	local info = state.info
+	local compact = orb and not info -- đang là nút tròn nhỏ
+	local collapsing = wasInfoShape and not info
+	wasInfoShape = info
+	local o = math.clamp(math.floor(ORB_TARGET_PX / ui + 0.5), ORB_MIN, ORB_MAX)
+
+	local anchor, pos
+	if orb then
+		anchor = Vector2.new(0, 0.5)
+		pos = UDim2.new(0, math.floor(8 / ui + 0.5), 0.5, 0) -- sát mép trái
+	else
+		anchor = Vector2.new(0.5, 0)
+		pos = UDim2.new(0.5, 0, 0, 10)
+	end
+
+	local size, radius
+	if info then
+		size, radius = UDim2.fromOffset(INFO_W, 52 + infoH + 10), 22
+	elseif orb then
+		size, radius = UDim2.fromOffset(o, o), o / 2
+	else
+		size, radius = UDim2.fromOffset(ISL_W_PILL, ISL_H), ISL_H / 2
+	end
+	local iconSize = compact and math.floor(o * 0.72) or 32
+	local iconOff = compact and math.floor((o - iconSize) / 2) or 8
+	local iconText = compact and math.max(16, math.floor(iconSize * 0.55)) or 18
+	local textT = compact and 1 or 0
+
+	islandIconLbl.Text = islandIconText()
+	gearBtn.Visible = not compact and not info
+	if info then infoList.Visible = true end
+
+	groupCancel(islGroup) -- huỷ tween cũ trước khi chuyển trạng thái mới
+	if animate then
+		local style, t = Enum.EasingStyle.Quint, 0.4
+		if info then
+			t = 0.3
+		elseif collapsing then
+			style, t = Enum.EasingStyle.Back, 0.45 -- thu gọn từ bảng chi tiết: đàn hồi nhẹ
+		end
+		local tw = groupTween(islGroup, island, t, { Size = size, Position = pos, AnchorPoint = anchor }, style)
+		groupTween(islGroup, islandCorner, t, { CornerRadius = UDim.new(0, radius) }, style)
+		groupTween(islGroup, islandIcon, t, { Size = UDim2.fromOffset(iconSize, iconSize), Position = UDim2.fromOffset(iconOff, iconOff) }, style)
+		groupTween(islGroup, islandIconLbl, 0.3, { TextSize = iconText })
+		groupTween(islGroup, islandTitle, 0.25, { TextTransparency = textT })
+		groupTween(islGroup, islandStatus, 0.25, { TextTransparency = textT })
+		tw.Completed:Once(function(ps)
+			if ps == Enum.PlaybackState.Completed and not state.info then infoList.Visible = false end
+		end)
+	else
+		island.Size, island.Position, island.AnchorPoint = size, pos, anchor
+		islandCorner.CornerRadius = UDim.new(0, radius)
+		islandIcon.Size, islandIcon.Position = UDim2.fromOffset(iconSize, iconSize), UDim2.fromOffset(iconOff, iconOff)
+		islandIconLbl.TextSize = iconText
+		islandTitle.TextTransparency, islandStatus.TextTransparency = textT, textT
+		infoList.Visible = info
+	end
+end
+
+-- Cập nhật chữ/biểu tượng theo tab và chức năng thực tế (chỉ gán khi dữ liệu thay đổi)
+local lastTitle, lastStatus
+refreshIsland = function()
+	local status
+	if state.tab == "Thông tin" then
+		status = "Phiên bản " .. SCRIPT_VERSION
+	else
+		local n = countEnabled()
+		status = n > 0 and (n .. " chức năng đang bật") or "Chưa bật chức năng nào"
+	end
+	if state.tab ~= lastTitle then
+		lastTitle = state.tab
+		islandTitle.Text = state.tab
+	end
+	if status ~= lastStatus then
+		lastStatus = status
+		islandStatus.Text = status
+	end
+	local ic = islandIconText()
+	if islandIconLbl.Text ~= ic then islandIconLbl.Text = ic end
+end
+
+local function showInfo()
+	if state.info then return end
+	refreshIsland()
+	infoH = fillInfoRows()
+	state.info = true
+	applyIsland(true)
+end
+
+local function hideInfo()
+	if not state.info then return end
+	state.info = false
+	applyIsland(true)
+end
+
+--========================= MỞ / ĐÓNG / THU NHỎ =========================
+-- open = cửa sổ đang hiện; minimized = (khi ẩn) thu Dynamic Island thành hình tròn bên trái.
+-- Chỉ ẩn/hiện giao diện: không tắt script, không huỷ GUI, giữ nguyên tab và trạng thái các nút.
+local visToken = 0
+local function setView(open, minimized)
+	minimized = minimized and not open
+	if state.open == open and state.minimized == minimized then return end
+	local openChanged = state.open ~= open
+	state.open, state.minimized = open, minimized
+
+	if openChanged then
+		visToken += 1
+		local token = visToken
+		groupCancel(winGroup)
+		if open then
+			applyLayout(false)
+			win.Visible = true
+			groupTween(winGroup, win, 0.35, { GroupTransparency = 0 })
+			groupTween(winGroup, winScale, 0.45, { Scale = 1 }, Enum.EasingStyle.Back)
+		else
+			closeDropdown()
+			local t = groupTween(winGroup, win, 0.25, { GroupTransparency = 1 })
+			groupTween(winGroup, winScale, 0.25, { Scale = minimized and 0.8 or 0.92 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			t.Completed:Once(function(ps)
+				-- ẩn hẳn cửa sổ khi hoạt ảnh xong: không còn khung vô hình chặn thao tác
+				if visToken == token and ps == Enum.PlaybackState.Completed then win.Visible = false end
+			end)
+		end
+	end
+	applyIsland(true)
+end
+
+--========================= NHẤN MỘT LẦN / NHẤN GIỮ TRÊN ISLAND =========================
+-- Island KHÔNG dùng Activated: dùng sự kiện đầu vào + ngưỡng thời gian để phân biệt chính xác.
+--   nhấn nhanh rồi thả      -> chuyển đổi đóng/mở GUI (từ hình tròn: mở lại GUI)
+--   giữ quá HOLD_TIME       -> mở bảng chi tiết; thả tay -> thu gọn, KHÔNG mở GUI, KHÔNG đổi chức năng
+--   kéo ra xa / bị huỷ      -> huỷ thao tác, không kích hoạt gì
+local press -- thao tác nhấn đang diễn ra (mỗi lúc chỉ một thao tác)
+
+local function endPress()
+	local rec = press
+	press = nil
+	if rec then
+		if rec.moveConn then rec.moveConn:Disconnect() end
+		if rec.endConn then rec.endConn:Disconnect() end
+	end
+end
+table.insert(cleanups, endPress)
+
+local function releasePress(rec, cancelled)
+	if press ~= rec then return end
+	local wasHeld = rec.held
+	endPress()
+	if wasHeld then hideInfo() return end
+	if cancelled then return end
+	setView(not state.open, false)
+end
+
+local function pointerPos(input)
+	if input.UserInputType == Enum.UserInputType.Touch then
+		return Vector2.new(input.Position.X, input.Position.Y)
+	end
+	return UserInputService:GetMouseLocation()
+end
+
+connect(island.InputBegan, function(input)
+	if press then return end
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+	-- chạm vào nút cài đặt thì để nút đó tự xử lý
+	if gearBtn.Visible and input.Position.X >= gearBtn.AbsolutePosition.X - 2 then return end
+
+	local rec = { input = input, origin = pointerPos(input), held = false }
+	press = rec
+	rec.endConn = input.Changed:Connect(function()
+		local s = input.UserInputState
+		if s == Enum.UserInputState.End then releasePress(rec, false)
+		elseif s == Enum.UserInputState.Cancel then releasePress(rec, true) end
+	end)
+	rec.moveConn = UserInputService.InputChanged:Connect(function(i)
+		if press ~= rec then return end
+		if i.UserInputType == Enum.UserInputType.MouseMovement or i == rec.input then
+			if (pointerPos(rec.input) - rec.origin).Magnitude > MOVE_TOL then releasePress(rec, true) end
+		end
+	end)
+	task.delay(HOLD_TIME, function()
+		if press == rec and not rec.held then
+			rec.held = true
+			showInfo()
+		end
+	end)
 end)
 
-local function setIsland(open)
-	tween(island, 0.45, { Size = UDim2.fromOffset(open and ISL_W_OPEN or ISL_W_CLOSED, ISL_H) }, Enum.EasingStyle.Back)
-	tween(nameLbl, 0.3, { TextTransparency = open and 0 or 1 })
-	tween(divider, 0.3, { BackgroundTransparency = open and 0.7 or 1 })
-	tween(timeLbl, 0.4, { Position = UDim2.new(0, open and 166 or 50, 0.5, 0) })
-end
-
---========================= MỞ / ĐÓNG CỬA SỔ =========================
-local visToken = 0
-local function setOpen(open)
-	if state.open == open then return end
-	state.open = open
-	visToken += 1
-	local token = visToken
-	setIsland(open)
-	if open then
-		applyLayout(false)
-		win.Visible = true
-		tween(win, 0.35, { GroupTransparency = 0 })
-		tween(winScale, 0.45, { Scale = 1 }, Enum.EasingStyle.Back)
-	else
-		closeDropdown()
-		local t = tween(win, 0.25, { GroupTransparency = 1 })
-		tween(winScale, 0.25, { Scale = 0.92 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-		t.Completed:Once(function()
-			if visToken == token then win.Visible = false end
-		end)
-	end
-	updateBlur(false)
-end
-
-connect(island.Activated, function() setOpen(not state.open) end)
+-- Mất focus cửa sổ giữa lúc đang nhấn: huỷ để không bị kẹt bảng chi tiết
+connect(UserInputService.WindowFocusReleased, function()
+	if press then releasePress(press, true) end
+end)
 
 connect(gearBtn.Activated, function()
-	if state.minimized then
-		state.minimized = false
-		applyLayout(true)
-	end
 	showTab("Cài đặt")
-	setOpen(true)
-end)
-
-connect(pauseBtn.Activated, function()
-	paused = not paused
-	bar1.Visible, bar2.Visible, playLbl.Visible = not paused, not paused, paused
-	local msg = paused and "Đã tạm dừng bộ đếm" or "Đã tiếp tục bộ đếm"
-	showToast(msg)
-	notifySystem(SCRIPT_NAME, msg)
+	setView(true, false)
 end)
 
 --========================= NÚT ĐIỀU KHIỂN CỬA SỔ =========================
@@ -794,18 +1055,13 @@ local function createCtrl(xOff, kind, onClick)
 	connect(b.Activated, onClick)
 end
 
-createCtrl(-14, "close", function() setOpen(false) end)
+createCtrl(-14, "close", function() setView(false, false) end) -- chỉ ẩn cửa sổ, script vẫn chạy
 createCtrl(-54, "max", function()
-	if state.minimized then state.minimized = false end
 	state.maximized = not state.maximized
 	closeDropdown()
 	applyLayout(true)
 end)
-createCtrl(-94, "min", function()
-	state.minimized = not state.minimized
-	closeDropdown()
-	applyLayout(true)
-end)
+createCtrl(-94, "min", function() setView(false, true) end) -- thu nhỏ thành hình tròn bên trái
 
 --========================= KÉO CỬA SỔ BẰNG THANH TIÊU ĐỀ =========================
 do
@@ -850,7 +1106,8 @@ gui.Destroying:Once(function()
 	for _, c in connections do c:Disconnect() end
 	table.clear(connections)
 	for _, fn in cleanups do fn() end
-	if blur then blur:Destroy() end
+	groupCancel(winGroup)
+	groupCancel(islGroup)
 end)
 
 --========================= KHỞI ĐỘNG =========================
@@ -858,10 +1115,11 @@ applyGlass(false)
 applyBright()
 updateScale()
 showTab("Cài đặt", true)
+applyIsland(false)
 gui.Parent = playerGui
 
 task.delay(0.4, function()
-	setOpen(true)
+	setView(true, false)
 	showToast("chan chan đã sẵn sàng")
 	notifySystem(SCRIPT_NAME, "Script đã khởi động")
 end)
